@@ -24,7 +24,7 @@ import json
 import os
 
 import fv_stats as stats
-from fv_store import MONEY_IN, MONEY_OUT, StoreError, canonical, check_date, now, sha256_file, today
+from fv_store import MONEY_IN, MONEY_OUT, StoreError, _float, canonical, check_date, now, sha256_file, today
 
 MULTI_ARM = ("ab_test", "price_test")
 TYPE_HINTS = {
@@ -39,6 +39,14 @@ TYPE_HINTS = {
 
 def validate_design(xtype, d):
     """Return a list of what is missing from an experiment design. Empty list = ready to register."""
+    if not isinstance(d, dict):
+        return ["design: an object with the fields in references/experiments.md"]
+    for key in ("primary_metric", "stopping_rule", "decision_rule", "outcomes", "price_points"):
+        if key in d and not isinstance(d[key], dict):
+            return ["%s: must be an object" % key]
+    if "variants" in d and (not isinstance(d["variants"], list) or not all(isinstance(v, str) and v for v in d["variants"])
+                            or len(set(d["variants"])) != len(d["variants"])):
+        return ["variants: a list of distinct names, the control first"]
     miss = []
     for k, why in (("learn", "what you need to learn"), ("population", "who is being tested"),
                    ("method", "how the test runs"), ("qualification", "what makes a visitor or prospect count as qualified")):
@@ -58,19 +66,23 @@ def validate_design(xtype, d):
             miss.append("variants: at least two, the first is the control")
         if not _unit(rule.get("min_effect")):
             miss.append("decision_rule.min_effect: the smallest absolute difference worth acting on (for example 0.02)")
+        if "alpha" in rule and not (_unit(rule["alpha"]) and rule["alpha"] < 1):
+            miss.append("decision_rule.alpha: a significance level between 0 and 1 (default 0.05)")
+        if d.get("price_points") and not all(_number(v) and v > 0 for v in d["price_points"].values()):
+            miss.append("price_points: every price must be a positive number")
         if xtype == "price_test":
             pp = d.get("price_points") or {}
             if set(pp) != set(d.get("variants") or []) or len(set(pp.values())) < 2:
                 miss.append("price_points: one distinct price per variant")
     else:
-        if not _unit(rule.get("success_at")) or rule.get("fail_below") is None or not 0 <= rule["fail_below"] <= rule.get("success_at", 0):
+        if not _unit(rule.get("success_at")) or not _number(rule.get("fail_below")) or not 0 <= rule["fail_below"] <= rule["success_at"]:
             miss.append("decision_rule: success_at and fail_below as rates (0.05 = 5%), fail_below not above success_at")
     out = d.get("outcomes") or {}
     for k in ("success", "failure", "inconclusive"):
         if not str(out.get(k) or "").strip():
             miss.append("outcomes.%s: what you will conclude and do if the result is a %s" % (k, k))
-    if d.get("cost_estimate") is None or d.get("days_estimate") is None:
-        miss.append("cost_estimate and days_estimate")
+    if not _number(d.get("cost_estimate")) or not _number(d.get("days_estimate")):
+        miss.append("cost_estimate and days_estimate, as numbers")
     if xtype in ("preorder", "price_test", "pilot", "concierge") and not str(d.get("offer_terms") or "").strip():
         miss.append("offer_terms: exactly what the customer is told about price, delivery date, refunds and when they are charged")
     return miss
@@ -80,12 +92,18 @@ def _posint(v):
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
 
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
+
+
 def _unit(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 1
+    return _number(v) and 0 < v <= 1
 
 
 def register(store, x):
     """Record a design. This is the pre-registration: it is dated and audited before any data exists."""
+    if not isinstance(x, dict):
+        raise StoreError("an experiment must be a JSON object")
     for k in ("type", "title", "design"):
         if not x.get(k):
             raise StoreError("experiment needs '%s'" % k)
@@ -104,8 +122,11 @@ def launch(store, xid, launched_on=None):
     x = store.get("experiments", xid, "experiment")
     if x["status"] != "designed":
         raise StoreError("%s is already %s" % (xid, x["status"]))
-    store.update("experiments", xid, {"status": "running",
-                                      "launched_at": check_date(launched_on or today(), "launched_on")}, action="launch")
+    day = check_date(launched_on or today(), "launched_on")
+    if day < x["registered_at"][:10]:
+        raise StoreError("%s was registered on %s. A launch date before that would mean the data came before the design:"
+                         " that is not a pre-registered test." % (xid, x["registered_at"][:10]))
+    store.update("experiments", xid, {"status": "running", "launched_at": day}, action="launch")
 
 
 def amend(store, xid, change, reason):
@@ -121,6 +142,8 @@ def _running(store, xid, what):
         raise StoreError("%s has not launched. Launch it first; data from before launch is not part of the test." % xid)
     if x["status"] == "abandoned":
         raise StoreError("%s was abandoned: no new %s" % (xid, what))
+    if x["status"] == "completed" and what == "events":
+        raise StoreError("%s is closed. Its result stands as read; run a new experiment for new data." % xid)
     return x
 
 
@@ -132,6 +155,8 @@ def record_events(store, xid, events, batch=None):
     batch = batch or "manual:%s" % now()
     ids = []
     for e in events:
+        if not isinstance(e, dict):
+            raise StoreError("each event must be a JSON object")
         for k in ("event", "count", "occurred_on", "origin_record"):
             if e.get(k) in (None, ""):
                 raise StoreError("an event needs '%s' (origin_record = the export, dashboard or log the count came from)" % k)
@@ -152,7 +177,7 @@ def record_events(store, xid, events, batch=None):
             "experiment_id": xid, "variant": variant, "event": e["event"], "count": e["count"],
             "qualified": None if e["qualified"] is None else int(e["qualified"]), "occurred_on": day,
             "traffic_source": e.get("traffic_source", ""), "audience": e.get("audience", ""),
-            "price_point": e.get("price_point"), "cost": float(e.get("cost") or 0),
+            "price_point": _float(e.get("price_point"), "price_point"), "cost": _float(e.get("cost"), "cost") or 0.0,
             "origin_record": e["origin_record"], "import_batch": batch}))
     return ids
 
@@ -192,6 +217,8 @@ def void_event(store, event_id, reason):
 
 
 def add_transaction(store, t):
+    if not isinstance(t, dict):
+        raise StoreError("a transaction must be a JSON object")
     for k in ("payer_ref", "kind", "amount", "currency", "occurred_on", "reference"):
         if t.get(k) in (None, ""):
             raise StoreError("a transaction needs '%s' (reference = the receipt, invoice or contract id)" % k)
@@ -202,14 +229,11 @@ def add_transaction(store, t):
         _running(store, t["experiment_id"], "transactions")
     if t.get("participant_id"):
         store.get("participants", t["participant_id"], "participant")
-    try:
-        amount = float(t["amount"])
-    except (TypeError, ValueError):
-        raise StoreError("amount must be a number")
+    amount = _float(t["amount"], "amount")
     return store.insert("transactions", {
         "experiment_id": t.get("experiment_id"), "participant_id": t.get("participant_id"),
         "payer_ref": str(t["payer_ref"]), "kind": t["kind"], "amount": amount, "currency": t["currency"],
-        "price_point": t.get("price_point"), "variant": t.get("variant") or "all",
+        "price_point": _float(t.get("price_point"), "price_point"), "variant": t.get("variant") or "all",
         "occurred_on": check_date(t["occurred_on"], "occurred_on"), "reference": str(t["reference"]),
         "authorized": 1, "segment_id": t.get("segment_id")})
 
@@ -241,7 +265,10 @@ def money(store, experiment_id=None, ids=None):
     else:
         rows = store.rows("SELECT * FROM transactions")
     live = [t for t in rows if not t["voided_at"]]
-    net = payers(live)
+    # Net each payer over EVERYTHING they did, not only the rows selected here: a refund filed against another
+    # experiment, or simply left out of the selection, still means the customer did not pay.
+    everything = payers(store.rows("SELECT * FROM transactions WHERE voided_at IS NULL"))
+    net = {p: everything.get(p, 0.0) for p in {t["payer_ref"] for t in live}}
     paying = sorted(p for p, v in net.items() if v > 0)
     repeat = sorted({t["payer_ref"] for t in live if t["kind"] == "repeat_payment"} & set(paying))
     currencies = sorted({t["currency"] for t in live})
@@ -367,7 +394,8 @@ def _read_multi(res, arms, rule, reached, looks):
              "relative_lift": t["relative_lift"], "p_value": t["p_value"], "approximation_ok": t["approximation_ok"],
              "significant": t["approximation_ok"] and t["p_value"] < alpha,
              "practical": abs(t["diff"]) >= rule["min_effect"]}
-        if control["price_point"] is not None and a["price_point"] is not None and t["approximation_ok"]:
+        if control["price_point"] is not None and a["price_point"] is not None and t["approximation_ok"] \
+                and control["price_point"] != a["price_point"]:
             c["arc_elasticity"] = stats.arc_elasticity(control["price_point"], control["rate"], a["price_point"], a["rate"])
         comparisons.append(c)
     res["comparisons"] = comparisons

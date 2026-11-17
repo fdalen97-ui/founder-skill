@@ -82,9 +82,11 @@ def _dimension_block(d):
                 L.append("| %s | %s: %s | %d | %d %s |" % (side, cat, CATEGORIES[cat], c["units"], c["strong_units"], UNIT_NAMES[cat]))
         L.append("")
     for e in d["items"]:
-        if e["retracted_at"]:
-            continue
         tag = ("%s, " % SIM) if e["category"] == "B" else ("ASSUMPTION, " if e["category"] == "A" else "")
+        if e["retracted_at"]:
+            L.append("- %s (%sRETRACTED, %s): %s. Reason: %s" % (e["id"], tag, e["category"], _cell(e["summary"]).rstrip("."),
+                                                             _cell(e["retract_reason"])))
+            continue
         L.append("- %s (%s%s, %s, %s): %s. _%s_" % (e["id"], tag, e["category"], e["stance"], e["collected_on"],
                                                   _cell(e["summary"]).rstrip("."), e["resolved"]))
     if d["items"]:
@@ -207,9 +209,10 @@ def report(snap):
             s["title"], s["id"], s["population"], s["distributed_via"] or "not recorded", s["fielded_from"] or "?",
             s["fielded_to"] or "?", s["received"], s["valid"], _kv(s["excluded"]) or "none"), "",
             "Representative? " + s["representative"], ""]
-        for heading, kinds in (("Reported past behaviour", ("behavioral", "screening")),
+        for heading, kinds in (("Reported past behaviour", ("behavioral",)),
                                ("Stated preferences (what people say, not what they do)", ("stated", "pricing")),
-                               ("Who answered", ("demographic",))):
+                               ("Who answered (screening and background; every valid respondent passed the screener)",
+                                ("screening", "demographic"))):
             qs = [q for q in s["questions"] if q["kind"] in kinds]
             if not qs:
                 continue
@@ -300,7 +303,9 @@ def report(snap):
     for x in snap["interviews"]["contradictions"]:
         L.append("- Interview extract %s (%s): %s" % (x["id"], "verbatim" if x["verbatim"] else "summary", _cell(x["text"])))
     for e in retracted:
-        L.append("- Retracted %s on %s: %s. Reason: %s" % (e["id"], e["retracted_at"][:10], _cell(e["summary"]), _cell(e["retract_reason"])))
+        L.append("- Retracted %s (%s%s) on %s: %s. Reason: %s" % (
+            e["id"], e["category"], ", %s" % SIM if e["category"] == "B" else "", e["retracted_at"][:10], _cell(e["summary"]),
+            _cell(e["retract_reason"])))
     if not (contra or failed or retracted or snap["interviews"]["contradictions"]):
         L.append("None recorded. With little real evidence collected, that is absence of testing, not absence of problems.")
     L.append("")
@@ -310,9 +315,10 @@ def report(snap):
           "| --- | --- | --- | ---: | --- | ---: |"]
     for h in snap["hypotheses"]:
         if not h["answered"]:
-            L.append("| %s | %s | %s | %.1f | %s%s | %d |" % (h["id"], h["area"], _cell(h["statement"]), h["priority"], h["status"],
-                                                           ", explored synthetically only" if h["explored_synthetically"] and not h["real_items"] else "",
-                                                           h["real_items"]))
+            L.append("| %s | %s | %s | %.1f | %s%s%s | %d |" % (h["id"], h["area"], _cell(h["statement"]), h["priority"], h["status"],
+                                                             ", explored synthetically only" if h["explored_synthetically"] and not h["real_items"] else "",
+                                                             ", evidence predates the current wording" if h["evidence_predates_wording"] else "",
+                                                             h["real_items"]))
     L += ["", "Priority = impact if false x uncertainty / average of cost and time to test (each 1 to 5).", ""]
 
     # 15 -----------------------------------------------------------------------

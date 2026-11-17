@@ -66,8 +66,15 @@ against it.
 | C | external research | `{"sources": ["SRC001"]}` | distinct sources (weak at most) |
 | D | customer interview | `{"extracts": [ids]}` | distinct interviewed people |
 | E | survey | `{"survey": "SV001", "question": "q2", "match": {"in": ["Weekly"]}}` | valid matching answers |
-| F | observed behaviour | `{"experiment": "X001", "event": "demo_request", "denominator": "visit"}` | qualified events |
+| F | observed behaviour | `{"experiment": "X001", "event": "demo_request", "denominator": "visit"}` | qualified events, one pool per experiment |
 | G | purchase or commitment | `{"experiment": "X001"}` or `{"transactions": ["T001"]}` | distinct net payers |
+
+Behaviour evidence follows the experiment's own result. Events from an
+experiment that failed its pre-set line cannot be filed as support, and an
+experiment counts against a claim (by the qualified people who saw the offer and
+did not act) only when it failed. The denominator event, such as `visit`, is
+never an action. Screening answers do not count as past behaviour: every valid
+respondent passed the screener.
 
 `match` accepts `in` (a list of options), `gte`, `lte` and `eq` for numbers. Add
 `"among": {"question": "q1", "in": ["Yes"]}` to count within a subgroup. The
@@ -189,7 +196,10 @@ The database enforces these; do not look for a way around them.
   original stays visible.
 - An experiment's design locks at launch. Changes are amendments on the record.
 - Every write is logged with who made it, in a hash-chained table.
-  `validate.py audit` detects any edit made outside the tool.
+  `validate.py audit` shows when audit entries were edited or removed.
+- What this protects against is self-deception and casual edits. Someone with the
+  file and the intent to rewrite it wholesale can still do so; it is not a
+  notarised ledger.
 - Store the least personal data that does the job: a participant label is
   optional, and contact details stay out of the record entirely.
 - `participant redact` removes a person's words and stored transcript and stops

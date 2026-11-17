@@ -166,14 +166,20 @@ def archetype_mix(customer):
 
 
 def validate_customer(c):
+    if not isinstance(c, dict):
+        raise StoreError("the lab profile must be a JSON object")
     for k in ("business", "target", "situation", "segments", "alternatives"):
         if c.get(k) in (None, "", []):
             raise StoreError("the lab profile needs '%s'%s" % (k, {
                 "situation": ": a neutral description of the moment being studied, with no mention of your product",
                 "alternatives": ": what these people use or do today (including 'nothing')"}.get(k, "")))
-    for s in c["segments"]:
-        if "name" not in s:
-            raise StoreError("every segment needs a name")
+    if not isinstance(c["segments"], list) or not all(isinstance(s, dict) and s.get("name") for s in c["segments"]):
+        raise StoreError("every segment needs a name")
+    if sum(float(s.get("share", 1)) for s in c["segments"]) <= 0:
+        raise StoreError("the segment shares add up to nothing")
+    age = c.get("age")
+    if age is not None and not (isinstance(age, list) and len(age) == 2 and all(isinstance(v, int) for v in age) and age[0] <= age[1]):
+        raise StoreError("age must be a range like [25, 45]")
     hits = PROMO.findall(c["situation"])
     if hits:
         raise StoreError("the situation text reads like a pitch. Describe the moment neutrally.")
@@ -197,8 +203,13 @@ def deal(customer, n, seed, arms):
     rng = random.Random(seed)
     shares = archetype_mix(customer)
     arche = []
-    for a, k in zip(ARCHETYPE_IDS, _quota([shares[a] for a in ARCHETYPE_IDS], n)):
-        arche += [a] * k
+    counts = dict(zip(ARCHETYPE_IDS, _quota([shares[a] for a in ARCHETYPE_IDS], n)))
+    spare = counts["enthusiast"] - int(n * MAX_ENTHUSIAST)
+    if spare > 0:                      # rounding must never push enthusiasts over the cap: the extra seats go to skeptics
+        counts["enthusiast"] -= spare
+        counts["skeptic"] += spare
+    for a in ARCHETYPE_IDS:
+        arche += [a] * counts[a]
     segs = []
     for s, k in zip(customer["segments"], _quota([float(s.get("share", 1)) for s in customer["segments"]], n)):
         segs += [s] * k
@@ -433,6 +444,8 @@ def import_panel(store, panel_dir, model="not recorded"):
                 with open(path, encoding="utf-8") as fh:
                     a = json.load(fh)
             except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(a, dict):
                 continue
             store.insert("syn_responses", {"run_id": rid, "persona_id": c["id"], "stage": "panel", "repeat": 1,
                                            "answer_json": canonical(a)})

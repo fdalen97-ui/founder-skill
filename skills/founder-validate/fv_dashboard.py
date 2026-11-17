@@ -1,9 +1,10 @@
 """The validation dashboard for founder-validate: one self-contained HTML file, no network.
 
-Real and simulated data never share a chart. Real marks are solid blue. Simulated
-marks are orange, hatched, dashed and carry the word SIMULATED, so the difference
-survives a black-and-white print and colour blindness. Grade meters fill only
-from real evidence.
+Real marks are solid blue. Simulated marks are orange, hatched, dashed and carry
+the word SIMULATED, so the difference survives a black-and-white print and colour
+blindness. The two appear together in one place only: the prediction-against-
+result comparison, where each bar is labelled and the text says they are never
+averaged. Grade meters fill only from real evidence.
 """
 
 import json
@@ -346,7 +347,8 @@ document.addEventListener("mousemove", ev => {
 
 
 def render(snap):
-    data = json.dumps(clean(snap), ensure_ascii=False).replace("</", "<\\/")
+    # "<" is written as \u003c so that no stored text can open a comment or a tag inside the data block.
+    data = json.dumps(clean(snap), ensure_ascii=False).replace("<", "\\u003c")
     title = "%s · Validation dashboard" % snap["project"]
     html = TEMPLATE.replace("<title>Validation dashboard</title>", "<title>%s</title>" % (
         title.replace("&", "&amp;").replace("<", "&lt;")))

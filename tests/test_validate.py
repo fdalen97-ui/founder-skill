@@ -32,6 +32,7 @@ ARMS = [{"id": "A", "offer": "A service that turns an inspection recording into 
          "price": 49, "scenario": "You have three reports due this week and see this offer in a trade newsletter."},
         {"id": "B", "offer": "A service that turns an inspection recording into a draft report you review and approve.",
          "price": 99, "scenario": "You have three reports due this week and see this offer in a trade newsletter."}]
+CLOCK = "2026-09-30T12:00:00Z"
 DESIGN = {
     "learn": "whether qualified adjusters ask for a demo", "population": "loss adjusters reached through a trade newsletter",
     "method": "one landing page with the price and a demo button", "qualification": "says they write reports monthly on the form",
@@ -45,6 +46,7 @@ DESIGN = {
 
 class Base(unittest.TestCase):
     def setUp(self):
+        os.environ["FOUNDER_VALIDATE_NOW"] = CLOCK       # fixtures launch in October 2026: registration must come first
         self.d = tempfile.mkdtemp()
         self.store = Store(os.path.join(self.d, "validation"), create=True)
         self.store.init_project("Fixture Co", "Draft inspection reports from recordings.", 49, "USD")
@@ -54,6 +56,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         shutil.rmtree(self.d)
+        os.environ.pop("FOUNDER_VALIDATE_NOW", None)
 
     # fixture helpers --------------------------------------------------------
     def hypothesis(self, area="problem", impact=5, uncertainty=5, cost=1, time=1, statement=None):
@@ -312,6 +315,217 @@ class SampleCounting(Base):
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.db.execute("INSERT INTO transactions (id, payer_ref, kind, amount, currency, occurred_on, reference,"
                                   " authorized, created_at) VALUES ('T9', 'x', 'payment', 1, 'USD', '2026-01-01', 'r', 0, 'now')")
+
+
+class ReviewFindings(Base):
+    """Regressions for defects an independent review found in the first version."""
+
+    def test_a_refund_counts_even_when_the_evidence_leaves_it_out(self):
+        xid = self.experiment("preorder", dict(DESIGN, offer_terms="Refundable."))
+        paid = [self.pay(xid, "p%d" % i) for i in range(10)]
+        for i in range(10):                                   # all ten refunded, filed against no experiment
+            experiments.add_transaction(self.store, {"payer_ref": "p%d" % i, "kind": "refund", "amount": 49, "currency": "USD",
+                                                     "occurred_on": "2026-10-09", "reference": "refund-%d" % i, "authorized": True})
+        c = self.claim("payment")
+        self.evidence(c, "G", {"transactions": paid})
+        self.evidence(c, "G", {"experiment": xid})
+        d = self.level("payment")
+        self.assertEqual((d["level"], d["support"]["G"]["units"]), ("Unknown", 0))
+        self.assertEqual(experiments.money(self.store, experiment_id=xid)["n_payers"], 0)
+
+    def test_an_unknown_match_operator_is_refused_not_treated_as_match_all(self):
+        sid, _ = SampleCounting.survey(self, [["r%d" % i, "2026-10-01", 120, "Yes", "1 to 5", "Likely"] for i in range(40)])
+        c = self.claim()
+        for ref in ({"survey": sid, "question": "q2", "match": {"equals": "More than 20"}},
+                    {"survey": sid, "question": "q2", "match": {"in": 5}},
+                    {"survey": sid, "question": "q2", "match": {"in": ["1 to 5"]}, "among": {"in": ["Yes"]}},
+                    {"survey": sid, "question": "q2", "match": {"in": ["1 to 5"]}, "among": {"question": "q1", "is": "Yes"}},
+                    {"survey": sid, "question": "q2", "match": {}}):
+            with self.assertRaises(StoreError):
+                self.evidence(c, "E", ref)
+        with self.assertRaises(StoreError):
+            research.matches("1 to 5", {"equals": "More than 20"})
+        self.evidence(c, "E", {"survey": sid, "question": "q2", "match": {"in": ["More than 20"]}})
+        self.assertEqual(self.level("problem")["level"], "Unknown")       # nobody gave that answer
+
+    def test_screening_answers_are_not_behaviour_evidence(self):
+        sid, _ = SampleCounting.survey(self, [["r%d" % i, "2026-10-01", 120, "Yes", "1 to 5", "Likely"] for i in range(100)])
+        self.evidence(self.claim(), "E", {"survey": sid, "question": "q1", "match": {"in": ["Yes"]}})
+        self.assertEqual(self.level("problem")["level"], "Weakly supported")   # everyone valid passed the screener
+        text = fv_report.report(score.snapshot(self.store))
+        behaviour = text.split("_Reported past behaviour_")[1].split("_Stated preferences")[0]
+        self.assertNotIn("Did you write an inspection report", behaviour)
+
+    def test_a_funnel_is_counted_once_and_exposure_is_not_an_action(self):
+        xid = self.experiment()
+        self.events(xid, "visit", 250)
+        for event in ("cta_click", "signup", "demo_request"):
+            self.events(xid, event, 12)
+        c = self.claim("demand")
+        for event in ("cta_click", "signup", "demo_request"):
+            self.evidence(c, "F", {"experiment": xid, "event": event, "denominator": "visit"})
+        d = self.level("demand")
+        self.assertEqual((d["support"]["F"]["units"], d["level"]), (12, "Moderately supported"))   # twelve people, not 36
+        with self.assertRaises(StoreError):
+            self.evidence(c, "F", {"experiment": xid, "event": "visit"})
+
+    def test_a_failed_experiment_cannot_be_filed_as_support(self):
+        xid = self.experiment()
+        self.events(xid, "visit", 10000)
+        self.events(xid, "demo_request", 30)                  # 0.3% against a failure line of 2%
+        self.assertEqual(experiments.read(self.store, xid)["outcome"], "failure")
+        c = self.claim("demand")
+        e = self.evidence(c, "F", {"experiment": xid, "event": "demo_request", "denominator": "visit"})
+        self.assertEqual(self.level("demand")["level"], "Unknown")
+        item = next(i for i in self.level("demand")["items"] if i["id"] == e)
+        self.assertIn("cannot count as support", item["resolved"]["detail"])
+        self.evidence(c, "F", {"experiment": xid, "event": "demo_request", "denominator": "visit"}, stance="contradicts")
+        self.assertEqual(self.level("demand")["level"], "Contradicted by evidence")
+        with self.assertRaises(StoreError):                   # a contradiction needs the people who did not act
+            self.evidence(c, "F", {"experiment": xid, "event": "demo_request"}, stance="contradicts")
+
+    def test_a_successful_experiment_cannot_be_filed_as_a_contradiction(self):
+        xid = self.experiment()
+        self.events(xid, "visit", 250)
+        self.events(xid, "demo_request", 20)
+        self.evidence(self.claim("demand"), "F", {"experiment": xid, "event": "demo_request", "denominator": "visit"},
+                      stance="contradicts")
+        self.assertEqual(self.level("demand")["contra_tier"], 0)
+
+    def test_a_re_export_without_keys_cannot_be_imported_twice(self):
+        inst = {"title": "t", "population": "p", "questions": [
+            {"id": "q1", "kind": "behavioral", "type": "single", "text": "How many reports last month?", "options": ["Few", "Many"]}]}
+        sid, _ = research.create_survey(self.store, inst)
+        for name, rows in (("a.csv", 20), ("b.csv", 21)):
+            path = os.path.join(self.d, name)
+            with open(path, "w", newline="") as fh:
+                csv.writer(fh).writerows([["q1"]] + [["Many"]] * rows)
+            if name == "a.csv":
+                research.import_responses(self.store, sid, path)
+            else:
+                with self.assertRaises(StoreError):
+                    research.import_responses(self.store, sid, path)
+        self.assertEqual(research.count_matching(self.store, sid, "q1", {"in": ["Many"]}), (20, 20))
+
+    def test_pre_registration_cannot_be_backdated_and_a_closed_test_takes_no_more_data(self):
+        xid = self.experiment(launch=None)
+        with self.assertRaises(StoreError):
+            experiments.launch(self.store, xid, "2020-01-01")
+        experiments.launch(self.store, xid, "2026-10-01")
+        for bad in ("20261005", "2026-W41-1", "5 October"):
+            with self.assertRaises(StoreError):
+                experiments.record_events(self.store, xid, [{"event": "visit", "count": 1, "qualified": True,
+                                                             "occurred_on": bad, "origin_record": "x"}])
+        self.events(xid, "visit", 300)
+        self.events(xid, "demo_request", 3)
+        experiments.complete(self.store, xid, "failed")
+        with self.assertRaises(StoreError):                   # topping up a closed, failed test
+            self.events(xid, "demo_request", 40)
+        self.assertEqual(experiments.read(self.store, xid)["outcome"], "failure")
+
+    def test_a_hypothesis_is_graded_under_the_caps_of_its_claims(self):
+        h = self.hypothesis("commercial", statement="They pay 49 a month")
+        self.evidence(self.claim("payment", hypothesis_id=h), "D", {"extracts": self.interviewed(10, kind="spend")})
+        got = next(x for x in score.hypotheses(self.store) if x["id"] == h)
+        self.assertEqual((got["status"], got["answered"]), ("Unknown", False))
+        self.store.revise_hypothesis(h, {"statement": "They pay 99 a month"}, "price raised")
+        self.assertFalse(next(x for x in score.hypotheses(self.store) if x["id"] == h)["evidence_predates_wording"])
+        os.environ["FOUNDER_VALIDATE_NOW"] = "2026-10-20T00:00:00Z"
+        self.store.revise_hypothesis(h, {"statement": "They pay 149 a month"}, "price raised again")
+        self.assertTrue(next(x for x in score.hypotheses(self.store) if x["id"] == h)["evidence_predates_wording"])
+
+    def test_a_research_link_is_not_a_demand_signal(self):
+        self.evidence(self.claim("problem"), "D", {"extracts": self.interviewed(5)})
+        src = self.store.add_research_source({"title": "Report", "url": "https://example.org/r"})
+        self.evidence(self.claim("demand"), "C", {"sources": [src]})
+        self.assertEqual(self.level("demand")["level"], "Weakly supported")
+        self.assertEqual(score.verdict(score.dimensions(self.store))["decision"], "No recommendation yet")
+
+    def test_a_quote_must_match_whole_words_from_the_participant(self):
+        pid = research.add_participant(self.store, {"consent": "recorded", "consent_scope": "quotes"})
+        path = os.path.join(self.d, "t.txt")
+        with open(path, "w") as fh:
+            fh.write("Interviewer: So you would definitely buy this today?\n"
+                     "Participant: I am unhappy with it and I never use it daily.\n")
+        iv = research.add_interview(self.store, {"participant_id": pid, "guide_type": "problem_discovery",
+                                                 "conducted_on": "2026-10-01", "record_kind": "transcript", "record_path": path})
+        for fake in ("happy with it and I", "ever use it daily", "you would definitely buy this today"):
+            with self.assertRaises(StoreError):
+                research.add_extract(self.store, {"interview_id": iv, "kind": "statement", "verbatim": True, "text": fake})
+        x = research.add_extract(self.store, {"interview_id": iv, "kind": "behavior", "verbatim": True,
+                                              "text": "I never use it daily"})
+        c = self.claim()
+        self.evidence(c, "D", {"extracts": [x]})
+        self.assertEqual(self.level("problem")["support"]["D"]["units"], 1)
+        research.update_participant(self.store, pid, {"consent": "none"})       # consent withdrawn without a redaction
+        self.assertEqual(self.level("problem")["support"]["D"]["units"], 0)
+        with self.assertRaises(StoreError):
+            research.add_extract(self.store, {"interview_id": iv, "kind": "statement", "text": "more"})
+
+    def test_bad_shapes_are_refused_at_the_door_and_cannot_break_the_record(self):
+        for inst in ([], {"title": "t", "population": "p", "questions": ["q1"]},
+                     {"title": "t", "population": "p", "questions": [{"id": "q1", "kind": "open", "type": "text"}]},
+                     {"title": "t", "population": "p", "van_westendorp": {"cheap": "q1"},
+                      "questions": [{"id": "q1", "kind": "pricing", "type": "number", "text": "At what price is it a bargain?"}]},
+                     {"title": "t", "population": "p", "gabor_granger": "q1",
+                      "questions": [{"id": "q1", "kind": "pricing", "type": "number", "text": "The most you paid last time?"}]}):
+            self.assertTrue(research.validate_instrument(inst)[0], inst)
+        for design in (dict(DESIGN, variants=["a", "b"], decision_rule={"min_effect": 0.02, "alpha": 5}),
+                       dict(DESIGN, decision_rule={"success_at": 0.05, "fail_below": "0.02"}),
+                       dict(DESIGN, primary_metric="demo_request"), "a string"):
+            self.assertTrue(experiments.validate_design("ab_test" if isinstance(design, dict) and "variants" in design
+                                                        else "landing_page", design), design)
+        xid = self.experiment("preorder", dict(DESIGN, offer_terms="Refundable."))
+        with self.assertRaises(StoreError):
+            experiments.add_transaction(self.store, {"experiment_id": xid, "payer_ref": "a", "kind": "payment", "amount": 49,
+                                                     "currency": "USD", "occurred_on": "2026-10-06", "reference": "r",
+                                                     "authorized": True, "price_point": "49 USD"})
+        c = self.claim()
+        for ref in ("R001", ["R001"], {"extracts": 5}, {"extracts": ["1"]}, {"sources": "SRC001"}):
+            with self.assertRaises(StoreError):
+                self.evidence(c, "D" if isinstance(ref, dict) and "extracts" in ref else "C", ref)
+        self.assertEqual(fv_report.status_text(score.snapshot(self.store)).splitlines()[0], "Fixture Co: No recommendation yet")
+
+    def test_infinite_and_comma_decimal_numbers_in_a_survey(self):
+        q = {"type": "number"}
+        self.assertIsNone(research._parse_answer(q, "inf"))
+        self.assertIsNone(research._parse_answer(q, "nan"))
+        self.assertEqual(research._parse_answer(q, "1,5"), 1.5)
+        self.assertEqual(research._parse_answer(q, "1,500"), 1500.0)
+        self.assertEqual(research._parse_answer(q, "2 490,00"), 2490.0)
+
+    def test_stored_text_cannot_break_out_of_the_dashboard_data_block(self):
+        self.store.add_claim({"description": "<!--<script>alert(1)</script> & </script>", "dimension": "problem"})
+        html = fv_dashboard.render(score.snapshot(self.store))
+        block = html.split('<script id="data" type="application/json">')[1].split("</script>")[0]
+        self.assertNotIn("<", block)
+        self.assertEqual(json.loads(block)["claims"][0]["description"], "<!--<script>alert(1)</script> & </script>")
+
+    def test_replace_cannot_overwrite_a_protected_row_and_exclusions_stick(self):
+        c = self.claim("payment")
+        e = self.evidence(c, "A")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.db.execute(
+                "INSERT OR REPLACE INTO evidence (id, claim_id, stance, category, ref_table, method, collected_on, summary,"
+                " origin, created_at) VALUES (?, ?, 'supports', 'G', 'transactions', 'm', '2026-01-01', 's', 'ai', 'n')", (e, c))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.db.execute("INSERT OR REPLACE INTO audit_log (id, at, actor, action, tbl, row_id, detail_json,"
+                                  " prev_hash, hash) VALUES (1, 'a', 'b', 'c', 'd', 'e', '{}', '', 'x')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.db.execute("UPDATE claims SET dimension = 'problem' WHERE id = ?", (c,))
+        sid, _ = SampleCounting.survey(self, [["r1", "2026-10-01", 120, "No", "1 to 5", "Likely"]])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.db.execute("UPDATE survey_responses SET excluded_reason = NULL")
+        xid = self.experiment()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.db.execute("UPDATE experiments SET launched_at = NULL WHERE id = ?", (xid,))
+
+    def test_enthusiasts_never_exceed_the_cap_after_rounding(self):
+        mix = {"enthusiast": 2, "skeptic": 2, "satisfied": 2, "no_problem": 1, "price_sensitive": 1, "high_power": 1, "tried_before": 1}
+        for n in (10, 11, 13, 17, 23):
+            cards = synth.deal(dict(CUSTOMER, archetype_mix=mix), n, 3, ARMS)
+            self.assertLessEqual(sum(1 for c in cards if c["archetype"] == "enthusiast"), int(n * 0.2), n)
+            self.assertEqual(len(cards), n)
 
 
 class Interviews(Base):
@@ -666,9 +880,12 @@ class SyntheticLab(Base):
 
 
 class Calibration(Base):
-    def pair(self, n=1, comparable=True):
-        rid = self.lab(stance=lambda card, rep: "interested" if int(card["id"][1:]) % 10 < 7 else "rejects")
-        for _ in range(n):
+    def pair(self, n=1, comparable=True, one_run=False):
+        stance = lambda card, rep: "interested" if int(card["id"][1:]) % 10 < 7 else "rejects"
+        rid = self.lab(stance=stance)
+        for i in range(n):
+            if i and not one_run:
+                rid = self.lab(stance=stance)          # an independent run per comparison
             pid = score.add_prediction(self.store, {"source": "synthetic", "run_id": rid, "prediction_type": "interest_share",
                                                     "measured_what": "share of simulated profiles expressing strong interest",
                                                     "predicted": 0.70, "segment_id": self.seg})
@@ -709,6 +926,24 @@ class Calibration(Base):
         self.assertAlmostEqual(row["sign_test_p"], 0.0625)
         self.assertIn("overestimated by 62.0 points", row["says"])
 
+    def test_one_run_or_one_experiment_is_one_observation_however_often_it_is_filed(self):
+        c = self.pair(n=5, one_run=True)                 # five predictions copied from the same synthetic run
+        self.assertFalse(c["calibrated"])
+        self.assertEqual(c["summary"][0]["comparable_pairs"], 1)
+        self.assertEqual([p["counted"] for p in c["pairs"]], [True, False, False, False, False])
+
+    def test_a_prediction_made_once_data_is_coming_in_is_refused(self):
+        xid = self.experiment()
+        self.events(xid, "visit", 250)
+        os.environ["FOUNDER_VALIDATE_NOW"] = "2026-10-08T00:00:00Z"
+        pid = score.add_prediction(self.store, {"source": "founder", "prediction_type": "demo_rate",
+                                                "measured_what": "my guess", "predicted": 0.08})
+        with self.assertRaises(StoreError):
+            score.add_outcome(self.store, {"prediction_id": pid, "experiment_id": xid, "event": "demo_request",
+                                           "denominator": "visit", "measured_what": "m", "comparable": True, "comparable_note": "n"})
+        with self.assertRaises(StoreError):
+            score.add_prediction(self.store, {"source": "founder", "prediction_type": "t", "measured_what": "m", "predicted": "10%"})
+
     def test_incomparable_pairs_never_feed_a_metric(self):
         c = self.pair(n=6, comparable=False)
         self.assertEqual(c["summary"], [])
@@ -723,7 +958,7 @@ class Calibration(Base):
             pid = score.add_prediction(self.store, {"source": "founder", "prediction_type": "demo_rate",
                                                     "measured_what": "my guess", "predicted": 0.08})
         finally:
-            del os.environ["FOUNDER_VALIDATE_NOW"]
+            os.environ["FOUNDER_VALIDATE_NOW"] = CLOCK
         with self.assertRaises(StoreError):
             score.add_outcome(self.store, {"prediction_id": pid, "experiment_id": xid, "event": "demo_request",
                                            "denominator": "visit", "measured_what": "m", "comparable": True, "comparable_note": "n"})
@@ -846,7 +1081,7 @@ class Grading(Base):
         self.evidence(self.claim("payment", hypothesis_id=price), "D", {"extracts": self.interviewed(2, kind="statement")})
         self.assertEqual(score.recommend(self.store)["experiment"]["id"], "price_test")
         h = next(x for x in score.hypotheses(self.store) if x["id"] == price)
-        self.assertEqual((h["status"], h["answered"], h["priority"]), ("Weakly supported", False, 25.0))
+        self.assertEqual((h["status"], h["answered"], h["priority"]), ("Unknown", False, 25.0))   # talk cannot answer payment
 
     def test_a_hypothesis_explored_only_synthetically_is_still_unanswered(self):
         h = self.hypothesis()
@@ -957,12 +1192,14 @@ class Documentation(unittest.TestCase):
 
 class CommandLine(unittest.TestCase):
     def setUp(self):
+        os.environ["FOUNDER_VALIDATE_NOW"] = CLOCK
         self.d = tempfile.mkdtemp()
         self.dir = os.path.join(self.d, "founder", "validation")
         self.lines = []
 
     def tearDown(self):
         shutil.rmtree(self.d)
+        os.environ.pop("FOUNDER_VALIDATE_NOW", None)
 
     def run_cli(self, *args, **kw):
         if "json" in kw:
@@ -1033,6 +1270,16 @@ class CommandLine(unittest.TestCase):
             report = fh.read()
         self.assertIn('Verbatim, PT001 (spend, extract 1): "I paid a temp four hundred dollars last month"', report)
         self.assertIn("No recommendation yet", report)
+
+    def test_wrong_shaped_input_is_a_clean_error_and_saves_nothing(self):
+        validate.main(["--dir", self.dir, "init", "--name", "x", "--concept", "y"], out=self.lines.append)
+        for kind, payload in (("evidence", "just a string"), ("participant", [1, 2]), ("transaction", "x"),
+                              ("claim", {"description": 5, "dimension": "problem"}), ("hypothesis", [[1]])):
+            self.assertEqual(self.run_cli("add", kind, json=payload), 2, kind)
+        self.assertEqual(self.run_cli("survey", "exclude", "abc", "--reason", "r"), 2)
+        self.assertEqual(self.run_cli("void", "event", "abc", "--reason", "r"), 2)
+        self.assertEqual(self.run_cli("recruit", json=["SEG001"]), 2)
+        self.assertEqual(self.run_cli("status"), 0)
 
     def test_plan_sample_and_guide_lint(self):
         validate.main(["--dir", self.dir, "init", "--name", "x", "--concept", "y"], out=self.lines.append)

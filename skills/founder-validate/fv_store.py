@@ -26,15 +26,24 @@ An evidence item's category, reference, claim and stance can never be edited and
 the row can never be deleted (SQLite triggers). To change your mind you retract
 it with a reason, and the retraction stays in the record. Every write is logged
 in a hash-chained audit table that can also not be edited.
+
+What this does and does not protect against: the constraints and triggers stop
+the tool, and anyone using ordinary SQL on the file, from blurring categories or
+quietly removing a finding. The hash chain shows when audit entries were edited
+or removed. Neither stops someone with the file and the intent to rewrite it
+wholesale (drop the triggers, rebuild the chain). It is a record that resists
+self-deception and casual edits, not a notarised ledger.
 """
 
 import datetime
 import hashlib
 import json
+import math
 import os
+import re
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CATEGORIES = {
     "A": "AI-generated hypothesis or assumption",
@@ -244,61 +253,6 @@ CREATE TABLE audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   tbl TEXT NOT NULL, row_id TEXT NOT NULL, detail_json TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
 
--- integrity triggers ---------------------------------------------------------
-CREATE TRIGGER evidence_no_promote BEFORE UPDATE OF category, ref_table, ref_json, claim_id, stance, origin,
-  method, collected_on, summary ON evidence
-BEGIN SELECT RAISE(ABORT, 'evidence is immutable: retract it with a reason and add a new item'); END;
-CREATE TRIGGER evidence_no_delete BEFORE DELETE ON evidence
-BEGIN SELECT RAISE(ABORT, 'evidence is never deleted: retract it with a reason'); END;
-CREATE TRIGGER evidence_no_unretract BEFORE UPDATE OF retracted_at, retract_reason ON evidence
-  WHEN OLD.retracted_at IS NOT NULL
-BEGIN SELECT RAISE(ABORT, 'a retraction is permanent: add a new evidence item instead'); END;
-CREATE TRIGGER claims_no_delete BEFORE DELETE ON claims
-BEGIN SELECT RAISE(ABORT, 'claims are never deleted'); END;
-CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_log
-BEGIN SELECT RAISE(ABORT, 'the audit trail is append-only'); END;
-CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_log
-BEGIN SELECT RAISE(ABORT, 'the audit trail is append-only'); END;
-CREATE TRIGGER syn_runs_frozen BEFORE UPDATE ON syn_runs
-BEGIN SELECT RAISE(ABORT, 'a synthetic run record is frozen: start a new run'); END;
-CREATE TRIGGER syn_runs_no_delete BEFORE DELETE ON syn_runs
-BEGIN SELECT RAISE(ABORT, 'synthetic runs are never deleted'); END;
-CREATE TRIGGER syn_responses_frozen BEFORE UPDATE ON syn_responses
-BEGIN SELECT RAISE(ABORT, 'synthetic responses are never edited'); END;
-CREATE TRIGGER syn_responses_no_delete BEFORE DELETE ON syn_responses
-BEGIN SELECT RAISE(ABORT, 'synthetic responses are never deleted'); END;
-CREATE TRIGGER experiment_design_locked BEFORE UPDATE OF design_json, type, hypothesis_id, registered_at ON experiments
-  WHEN OLD.launched_at IS NOT NULL
-BEGIN SELECT RAISE(ABORT, 'the design is locked at launch: record an amendment'); END;
-CREATE TRIGGER experiments_no_delete BEFORE DELETE ON experiments
-BEGIN SELECT RAISE(ABORT, 'experiments are never deleted: abandon it with a reason'); END;
-CREATE TRIGGER events_no_delete BEFORE DELETE ON behavior_events
-BEGIN SELECT RAISE(ABORT, 'behaviour events are never deleted: void them with a reason'); END;
-CREATE TRIGGER events_frozen BEFORE UPDATE OF experiment_id, variant, event, count, qualified, occurred_on,
-  traffic_source, price_point, cost, origin_record ON behavior_events
-BEGIN SELECT RAISE(ABORT, 'behaviour events are never edited: void and re-record'); END;
-CREATE TRIGGER transactions_no_delete BEFORE DELETE ON transactions
-BEGIN SELECT RAISE(ABORT, 'transactions are never deleted: void them with a reason'); END;
-CREATE TRIGGER transactions_frozen BEFORE UPDATE OF experiment_id, payer_ref, kind, amount, currency, price_point,
-  occurred_on, reference, authorized ON transactions
-BEGIN SELECT RAISE(ABORT, 'transactions are never edited: void and re-record'); END;
-CREATE TRIGGER responses_no_delete BEFORE DELETE ON survey_responses
-BEGIN SELECT RAISE(ABORT, 'survey responses are never deleted: exclude them with a reason'); END;
-CREATE TRIGGER responses_frozen BEFORE UPDATE OF survey_id, answers_json, row_sha256, respondent_key ON survey_responses
-BEGIN SELECT RAISE(ABORT, 'survey answers are never edited'); END;
-CREATE TRIGGER extracts_no_delete BEFORE DELETE ON interview_extracts
-BEGIN SELECT RAISE(ABORT, 'interview extracts are never deleted: redact the participant instead'); END;
-CREATE TRIGGER extracts_frozen BEFORE UPDATE OF interview_id, kind, verbatim, author ON interview_extracts
-BEGIN SELECT RAISE(ABORT, 'an extract cannot change kind, author or verbatim status'); END;
-CREATE TRIGGER extracts_text_frozen BEFORE UPDATE OF text ON interview_extracts
-  WHEN NEW.redacted_at IS NULL
-BEGIN SELECT RAISE(ABORT, 'extract text changes only through participant redaction'); END;
-CREATE TRIGGER predictions_frozen BEFORE UPDATE ON predictions
-BEGIN SELECT RAISE(ABORT, 'a prediction is frozen once recorded'); END;
-CREATE TRIGGER predictions_no_delete BEFORE DELETE ON predictions
-BEGIN SELECT RAISE(ABORT, 'predictions are never deleted, including the wrong ones'); END;
-CREATE TRIGGER outcomes_no_delete BEFORE DELETE ON outcomes
-BEGIN SELECT RAISE(ABORT, 'calibration outcomes are never deleted'); END;
 """ % {
     "areas": _in("area", AREAS), "dimensions": _in("dimension", DIMENSIONS), "stances": _in("stance", STANCES),
     "research_kinds": _in("kind", RESEARCH_KINDS), "roles": _in("role", ROLES),
@@ -306,6 +260,116 @@ BEGIN SELECT RAISE(ABORT, 'calibration outcomes are never deleted'); END;
     "ekinds": _in("kind", EXTRACT_KINDS), "xtypes": _in("type", EXPERIMENT_TYPES),
     "xstatus": _in("status", EXPERIMENT_STATUS), "tkinds": _in("kind", TRANSACTION_KINDS),
 }
+
+TRIGGERS = """
+-- integrity triggers ---------------------------------------------------------
+CREATE TRIGGER IF NOT EXISTS evidence_no_promote BEFORE UPDATE OF category, ref_table, ref_json, claim_id, stance, origin,
+  method, collected_on, summary ON evidence
+BEGIN SELECT RAISE(ABORT, 'evidence is immutable: retract it with a reason and add a new item'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_no_delete BEFORE DELETE ON evidence
+BEGIN SELECT RAISE(ABORT, 'evidence is never deleted: retract it with a reason'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_no_unretract BEFORE UPDATE OF retracted_at, retract_reason ON evidence
+  WHEN OLD.retracted_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a retraction is permanent: add a new evidence item instead'); END;
+CREATE TRIGGER IF NOT EXISTS claims_no_delete BEFORE DELETE ON claims
+BEGIN SELECT RAISE(ABORT, 'claims are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'the audit trail is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'the audit trail is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS syn_runs_frozen BEFORE UPDATE ON syn_runs
+BEGIN SELECT RAISE(ABORT, 'a synthetic run record is frozen: start a new run'); END;
+CREATE TRIGGER IF NOT EXISTS syn_runs_no_delete BEFORE DELETE ON syn_runs
+BEGIN SELECT RAISE(ABORT, 'synthetic runs are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS syn_responses_frozen BEFORE UPDATE ON syn_responses
+BEGIN SELECT RAISE(ABORT, 'synthetic responses are never edited'); END;
+CREATE TRIGGER IF NOT EXISTS syn_responses_no_delete BEFORE DELETE ON syn_responses
+BEGIN SELECT RAISE(ABORT, 'synthetic responses are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS experiment_design_locked BEFORE UPDATE OF design_json, type, hypothesis_id, registered_at ON experiments
+  WHEN OLD.launched_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'the design is locked at launch: record an amendment'); END;
+CREATE TRIGGER IF NOT EXISTS experiments_no_delete BEFORE DELETE ON experiments
+BEGIN SELECT RAISE(ABORT, 'experiments are never deleted: abandon it with a reason'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON behavior_events
+BEGIN SELECT RAISE(ABORT, 'behaviour events are never deleted: void them with a reason'); END;
+CREATE TRIGGER IF NOT EXISTS events_frozen BEFORE UPDATE OF experiment_id, variant, event, count, qualified, occurred_on,
+  traffic_source, price_point, cost, origin_record ON behavior_events
+BEGIN SELECT RAISE(ABORT, 'behaviour events are never edited: void and re-record'); END;
+CREATE TRIGGER IF NOT EXISTS transactions_no_delete BEFORE DELETE ON transactions
+BEGIN SELECT RAISE(ABORT, 'transactions are never deleted: void them with a reason'); END;
+CREATE TRIGGER IF NOT EXISTS transactions_frozen BEFORE UPDATE OF experiment_id, payer_ref, kind, amount, currency, price_point,
+  occurred_on, reference, authorized ON transactions
+BEGIN SELECT RAISE(ABORT, 'transactions are never edited: void and re-record'); END;
+CREATE TRIGGER IF NOT EXISTS responses_no_delete BEFORE DELETE ON survey_responses
+BEGIN SELECT RAISE(ABORT, 'survey responses are never deleted: exclude them with a reason'); END;
+CREATE TRIGGER IF NOT EXISTS responses_frozen BEFORE UPDATE OF survey_id, answers_json, row_sha256, respondent_key ON survey_responses
+BEGIN SELECT RAISE(ABORT, 'survey answers are never edited'); END;
+CREATE TRIGGER IF NOT EXISTS extracts_no_delete BEFORE DELETE ON interview_extracts
+BEGIN SELECT RAISE(ABORT, 'interview extracts are never deleted: redact the participant instead'); END;
+CREATE TRIGGER IF NOT EXISTS extracts_frozen BEFORE UPDATE OF interview_id, kind, verbatim, author ON interview_extracts
+BEGIN SELECT RAISE(ABORT, 'an extract cannot change kind, author or verbatim status'); END;
+CREATE TRIGGER IF NOT EXISTS extracts_text_frozen BEFORE UPDATE OF text ON interview_extracts
+  WHEN NEW.redacted_at IS NULL
+BEGIN SELECT RAISE(ABORT, 'extract text changes only through participant redaction'); END;
+CREATE TRIGGER IF NOT EXISTS predictions_frozen BEFORE UPDATE ON predictions
+BEGIN SELECT RAISE(ABORT, 'a prediction is frozen once recorded'); END;
+CREATE TRIGGER IF NOT EXISTS predictions_no_delete BEFORE DELETE ON predictions
+BEGIN SELECT RAISE(ABORT, 'predictions are never deleted, including the wrong ones'); END;
+CREATE TRIGGER IF NOT EXISTS outcomes_no_delete BEFORE DELETE ON outcomes
+BEGIN SELECT RAISE(ABORT, 'calibration outcomes are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS claims_frozen BEFORE UPDATE OF dimension, description, hypothesis_id ON claims
+BEGIN SELECT RAISE(ABORT, 'a claim cannot change its wording, question or hypothesis: add a new claim'); END;
+CREATE TRIGGER IF NOT EXISTS experiment_launch_frozen BEFORE UPDATE OF launched_at ON experiments
+  WHEN OLD.launched_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'the launch date is fixed once set'); END;
+CREATE TRIGGER IF NOT EXISTS surveys_frozen BEFORE UPDATE OF instrument_json ON surveys
+BEGIN SELECT RAISE(ABORT, 'a survey instrument is frozen once created: create a new survey'); END;
+CREATE TRIGGER IF NOT EXISTS surveys_no_delete BEFORE DELETE ON surveys
+BEGIN SELECT RAISE(ABORT, 'surveys are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS outcomes_frozen BEFORE UPDATE ON outcomes
+BEGIN SELECT RAISE(ABORT, 'a calibration outcome is frozen once recorded'); END;
+CREATE TRIGGER IF NOT EXISTS responses_no_unexclude BEFORE UPDATE OF excluded_reason ON survey_responses
+  WHEN OLD.excluded_reason IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'an excluded response stays excluded'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_unvoid BEFORE UPDATE OF voided_at, void_reason ON behavior_events
+  WHEN OLD.voided_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a voided event stays voided'); END;
+CREATE TRIGGER IF NOT EXISTS transactions_no_unvoid BEFORE UPDATE OF voided_at, void_reason ON transactions
+  WHEN OLD.voided_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a voided transaction stays voided'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_no_replace BEFORE INSERT ON evidence WHEN EXISTS (SELECT 1 FROM evidence WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS claims_no_replace BEFORE INSERT ON claims WHEN EXISTS (SELECT 1 FROM claims WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_replace BEFORE INSERT ON audit_log WHEN EXISTS (SELECT 1 FROM audit_log WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS syn_runs_no_replace BEFORE INSERT ON syn_runs WHEN EXISTS (SELECT 1 FROM syn_runs WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS syn_responses_no_replace BEFORE INSERT ON syn_responses WHEN EXISTS (SELECT 1 FROM syn_responses WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS predictions_no_replace BEFORE INSERT ON predictions WHEN EXISTS (SELECT 1 FROM predictions WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS outcomes_no_replace BEFORE INSERT ON outcomes WHEN EXISTS (SELECT 1 FROM outcomes WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS behavior_events_no_replace BEFORE INSERT ON behavior_events WHEN EXISTS (SELECT 1 FROM behavior_events WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS transactions_no_replace BEFORE INSERT ON transactions WHEN EXISTS (SELECT 1 FROM transactions WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS survey_responses_no_replace BEFORE INSERT ON survey_responses WHEN EXISTS (SELECT 1 FROM survey_responses WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS interview_extracts_no_replace BEFORE INSERT ON interview_extracts WHEN EXISTS (SELECT 1 FROM interview_extracts WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS experiments_no_replace BEFORE INSERT ON experiments WHEN EXISTS (SELECT 1 FROM experiments WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS surveys_no_replace BEFORE INSERT ON surveys WHEN EXISTS (SELECT 1 FROM surveys WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS interviews_no_replace BEFORE INSERT ON interviews WHEN EXISTS (SELECT 1 FROM interviews WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS hypotheses_no_replace BEFORE INSERT ON hypotheses WHEN EXISTS (SELECT 1 FROM hypotheses WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS research_sources_no_replace BEFORE INSERT ON research_sources WHEN EXISTS (SELECT 1 FROM research_sources WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a row with this id already exists and cannot be replaced'); END;
+"""
 
 ID_PREFIX = {"concepts": "K", "segments": "SEG", "hypotheses": "H", "claims": "C", "evidence": "E",
              "research_sources": "SRC", "syn_runs": "R", "participants": "PT", "interviews": "IV",
@@ -324,12 +388,42 @@ def today():
     return now()[:10]
 
 
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}($|[T ])")
+
+
 def check_date(value, field):
+    text = str(value)
     try:
-        datetime.date.fromisoformat(str(value)[:10])
+        if not _DATE.match(text):
+            raise ValueError(text)
+        datetime.date.fromisoformat(text[:10])
     except (TypeError, ValueError):
         raise StoreError("%s must be a date like 2026-03-14 (got %r)" % (field, value))
-    return str(value)[:10]
+    return text[:10]
+
+
+MATCH_OPS = ("in", "gte", "lte", "eq")
+
+
+def check_match(spec, what, need_question=False):
+    """Validate a survey match spec. An unknown key would silently match everyone, so it is refused."""
+    if not isinstance(spec, dict) or not spec:
+        raise StoreError("%s must be an object such as {\"in\": [\"Weekly\"]} or {\"gte\": 50}" % what)
+    ops = {k: v for k, v in spec.items() if k != "question"}
+    if need_question and not isinstance(spec.get("question"), str):
+        raise StoreError("%s needs 'question': the question id that defines the subgroup" % what)
+    if not need_question and "question" in spec:
+        raise StoreError("%s takes no 'question' key" % what)
+    unknown = sorted(set(ops) - set(MATCH_OPS))
+    if unknown or not ops:
+        raise StoreError("%s accepts only %s (got %s)" % (what, ", ".join(MATCH_OPS), ", ".join(unknown) or "nothing"))
+    if "in" in ops and (not isinstance(ops["in"], list) or not ops["in"] or not all(isinstance(x, str) for x in ops["in"])):
+        raise StoreError("%s: 'in' must be a non-empty list of answer options" % what)
+    for op in ("gte", "lte"):
+        if op in ops and (isinstance(ops[op], bool) or not isinstance(ops[op], (int, float))):
+            raise StoreError("%s: '%s' must be a number" % (what, op))
+    if "eq" in ops and (isinstance(ops["eq"], bool) or not isinstance(ops["eq"], (int, float, str))):
+        raise StoreError("%s: 'eq' must be a number or a string" % what)
 
 
 def sha256_text(text):
@@ -366,7 +460,8 @@ class Store(object):
             self.db.executescript(SCHEMA)
             self.db.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             self.db.execute("INSERT INTO meta VALUES ('created_at', ?)", (now(),))
-            self.db.commit()
+        self.db.executescript(TRIGGERS)      # idempotent: an older record gains any guard added since it was created
+        self.db.commit()
 
     def close(self):
         self.db.close()
@@ -541,8 +636,20 @@ class Store(object):
         cat = e["category"]
         if cat not in CATEGORIES:
             raise StoreError("category must be one of A to G (got %r)" % cat)
+        if not all(isinstance(e[k], str) for k in ("claim_id", "stance", "summary")):
+            raise StoreError("claim_id, stance and summary must be text")
         self.get("claims", e["claim_id"], "claim")
+        if e.get("ref") is not None and not isinstance(e["ref"], dict):
+            raise StoreError("ref must be an object naming the underlying record")
         ref = dict(e.get("ref") or {})
+        for key, kind in (("run", str), ("survey", str), ("question", str), ("experiment", str), ("event", str),
+                          ("denominator", str), ("variant", str)):
+            if key in ref and not isinstance(ref[key], kind):
+                raise StoreError("ref.%s must be text" % key)
+        for key, kind in (("sources", str), ("extracts", int), ("transactions", str)):
+            if key in ref and (not isinstance(ref[key], list) or not all(
+                    isinstance(x, kind) and not isinstance(x, bool) for x in ref[key])):
+                raise StoreError("ref.%s must be a list of %s" % (key, "ids" if kind is str else "extract numbers"))
         table = CATEGORY_TABLE[cat]
         method, collected = e.get("method"), e.get("collected_on")
         if cat == "A":
@@ -580,8 +687,11 @@ class Store(object):
             qids = {q["id"]: q for q in json.loads(sv["instrument_json"])["questions"]}
             if ref.get("question") not in qids:
                 raise StoreError("category E needs ref.question: a question id from %s" % sv["id"])
-            if not isinstance(ref.get("match"), dict) or not ref["match"]:
-                raise StoreError("category E needs ref.match, for example {\"in\": [\"Weekly\", \"Daily\"]} or {\"gte\": 50}")
+            check_match(ref.get("match"), "ref.match")
+            if "among" in ref:
+                check_match(ref["among"], "ref.among", need_question=True)
+                if ref["among"]["question"] not in qids:
+                    raise StoreError("ref.among points at an unknown question %r" % ref["among"]["question"])
             method = method or "survey (%s)" % sv["distributed_via"]
             collected = collected or sv["fielded_to"] or sv["created_at"][:10]
         elif cat == "F":
@@ -590,6 +700,13 @@ class Store(object):
                 raise StoreError("experiment %s has not launched, so it has observed nothing yet" % x["id"])
             if not ref.get("event"):
                 raise StoreError("category F needs ref.event: the observed action being counted")
+            metric = json.loads(x["design_json"])["primary_metric"]
+            if ref["event"] == metric["denominator"]:
+                raise StoreError("'%s' is the denominator of %s: being exposed to the offer is not an action. Count the"
+                                 " action people took (for example '%s')." % (ref["event"], x["id"], metric["event"]))
+            if e["stance"] == "contradicts" and not ref.get("denominator"):
+                raise StoreError("behaviour evidence against a claim needs ref.denominator, so the people who saw the"
+                                 " offer and did not act can be counted")
             method = method or "%s experiment" % x["type"].replace("_", " ")
             collected = collected or (x["completed_at"] or today())[:10]
         elif cat == "G":
@@ -648,6 +765,11 @@ def _float(v, field):
     if v in (None, ""):
         return None
     try:
-        return float(v)
+        if isinstance(v, bool):
+            raise ValueError(v)
+        v = float(v)
+        if not math.isfinite(v):
+            raise ValueError(v)
+        return v
     except (TypeError, ValueError):
         raise StoreError("%s must be a number (got %r)" % (field, v))

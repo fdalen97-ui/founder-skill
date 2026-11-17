@@ -14,13 +14,14 @@ words:
 
 import csv
 import json
+import math
 import os
 import re
 import shutil
 
 import fv_stats as stats
-from fv_store import (StoreError, PAST_BEHAVIOUR_KINDS, QUESTION_KINDS, canonical, check_date, now, sha256_file,
-                      sha256_text, today)
+from fv_store import (StoreError, PAST_BEHAVIOUR_KINDS, QUESTION_KINDS, _float, canonical, check_date, check_match, now,
+                      sha256_file, sha256_text, today)
 
 # ── question linting ────────────────────────────────────────────────────────────
 LINT_RULES = [
@@ -84,6 +85,8 @@ def lint_guide(text, guide_type="problem_discovery"):
 
 # ── participants ────────────────────────────────────────────────────────────────
 def add_participant(store, p):
+    if not isinstance(p, dict):
+        raise StoreError("a participant must be a JSON object")
     if p.get("segment_id"):
         store.get("segments", p["segment_id"], "segment")
     consent = p.get("consent", "none")
@@ -157,15 +160,26 @@ def normalise(text):
     return " ".join(t.lower().split())
 
 
+_INTERVIEWER = re.compile(r"^\s*(interviewer|intervjuer|moderator|researcher|founder|q)\s*[:>\-]", re.I)
+
+
 def transcript_text(path):
+    """The participant's side of a transcript: timing lines and lines labelled as the interviewer are left out."""
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().splitlines()
     if path.lower().endswith((".vtt", ".srt")):
         lines = [l for l in lines if not _TIMING.match(l)]
-    return "\n".join(lines)
+    return "\n".join(l for l in lines if not _INTERVIEWER.match(l))
+
+
+def quoted_in(quote, transcript):
+    """True if the quote appears as whole words. 'happy with it' is not found inside 'unhappy with it'."""
+    return re.search(r"(?<!\w)" + re.escape(normalise(quote)) + r"(?!\w)", normalise(transcript)) is not None
 
 
 def add_interview(store, iv):
+    if not isinstance(iv, dict):
+        raise StoreError("an interview must be a JSON object")
     for k in ("participant_id", "guide_type", "conducted_on", "record_kind", "record_path"):
         if not iv.get(k):
             raise StoreError("interview needs '%s'" % k)
@@ -185,11 +199,15 @@ def add_interview(store, iv):
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, iid + os.path.splitext(src)[1].lower())
     shutil.copyfile(src, dest)
-    store.insert("interviews", {
-        "participant_id": p["id"], "guide_type": iv["guide_type"],
-        "conducted_on": check_date(iv["conducted_on"], "conducted_on"), "interviewer": iv.get("interviewer", ""),
-        "medium": iv.get("medium", ""), "record_kind": iv["record_kind"], "record_path": dest,
-        "record_sha256": sha256_file(dest), "concept_id": iv.get("concept_id")})
+    try:
+        store.insert("interviews", {
+            "participant_id": p["id"], "guide_type": iv["guide_type"],
+            "conducted_on": check_date(iv["conducted_on"], "conducted_on"), "interviewer": iv.get("interviewer", ""),
+            "medium": iv.get("medium", ""), "record_kind": iv["record_kind"], "record_path": dest,
+            "record_sha256": sha256_file(dest), "concept_id": iv.get("concept_id")})
+    except StoreError:
+        os.remove(dest)          # do not leave a copy of someone's words behind for a record that was refused
+        raise
     if p["status"] != "interviewed":
         store.update("participants", p["id"], {"status": "interviewed"})
     return iid
@@ -197,10 +215,16 @@ def add_interview(store, iv):
 
 def add_extract(store, x):
     """One thing taken from one interview. verbatim=true is checked against the transcript, word for word."""
+    if not isinstance(x, dict):
+        raise StoreError("an extract must be a JSON object")
     for k in ("interview_id", "kind", "text"):
         if not x.get(k):
             raise StoreError("extract needs '%s'" % k)
     iv = store.get("interviews", x["interview_id"], "interview")
+    person = store.get("participants", iv["participant_id"], "participant")
+    if person["redacted_at"] or person["consent"] != "recorded":
+        raise StoreError("%s has withdrawn or has no consent on record: nothing more can be taken from this interview"
+                         % person["id"])
     verbatim = bool(x.get("verbatim"))
     text = " ".join(str(x["text"]).split())
     if verbatim:
@@ -215,16 +239,11 @@ def add_extract(store, x):
         quote = text.strip('"').strip()
         if len(quote.split()) < 3:
             raise StoreError("a verbatim quote needs at least three words")
-        if normalise(quote) not in normalise(transcript_text(iv["record_path"])):
+        if not quoted_in(quote, transcript_text(iv["record_path"])):
             raise StoreError("not found in the transcript of %s: %r. Quote the customer exactly, or save it as a summary"
                              " (verbatim: false)." % (iv["id"], quote[:80]))
         text = quote
-    amount = x.get("amount")
-    if amount is not None:
-        try:
-            amount = float(amount)
-        except (TypeError, ValueError):
-            raise StoreError("amount must be a number")
+    amount = _float(x.get("amount"), "amount")
     return store.insert("interview_extracts", {
         "interview_id": iv["id"], "kind": x["kind"], "text": text, "verbatim": 1 if verbatim else 0,
         "author": x.get("author", "ai"), "theme": (x.get("theme") or "").strip().lower(),
@@ -285,9 +304,22 @@ META_COLUMNS = ("respondent_key", "submitted_at", "duration_s")
 def validate_instrument(inst):
     """Check a survey instrument. Returns (errors, warnings). Errors block creation."""
     errors, warnings = [], []
+    if not isinstance(inst, dict):
+        return ["the survey must be a JSON object"], warnings
     for k in ("title", "population", "questions"):
         if not inst.get(k):
             errors.append("the survey needs '%s'" % k)
+    if not errors and (not isinstance(inst["questions"], list) or not all(isinstance(q, dict) for q in inst["questions"])):
+        errors.append("'questions' must be a list of question objects")
+    if errors:
+        return errors, warnings
+    for q in inst["questions"]:
+        if not isinstance(q.get("text"), str) or not q["text"].strip():
+            errors.append("%s: every question needs 'text'" % q.get("id"))
+        if "options" in q and (not isinstance(q["options"], list) or not all(isinstance(o, str) for o in q["options"])):
+            errors.append("%s: 'options' must be a list of strings" % q.get("id"))
+        if "qualifies" in q and not isinstance(q["qualifies"], list):
+            errors.append("%s: 'qualifies' must be a list" % q.get("id"))
     if errors:
         return errors, warnings
     seen = set()
@@ -324,11 +356,17 @@ def validate_instrument(inst):
     if "behavioral" not in kinds:
         warnings.append("no question about past behaviour: every answer will be a stated preference, which caps what"
                         " this survey can support")
-    for name, spec in (("van_westendorp", inst.get("van_westendorp")), ("gabor_granger", inst.get("gabor_granger"))):
-        if spec:
-            for qid in (spec.values() if isinstance(spec, dict) else []):
-                if qid not in seen:
-                    errors.append("%s points at an unknown question %r" % (name, qid))
+    numeric = {q["id"] for q in inst["questions"] if q.get("type") == "number"}
+    for name, keys in (("van_westendorp", {"too_cheap", "cheap", "expensive", "too_expensive"}), ("gabor_granger", {"question"})):
+        spec = inst.get(name)
+        if spec is None:
+            continue
+        if not isinstance(spec, dict) or set(spec) != keys:
+            errors.append("%s must map exactly these keys to question ids: %s" % (name, ", ".join(sorted(keys))))
+            continue
+        for qid in spec.values():
+            if qid not in numeric:
+                errors.append("%s points at %r, which is not a number question in this survey" % (name, qid))
     return errors, warnings
 
 
@@ -369,10 +407,14 @@ def _parse_answer(q, raw):
     if raw == "":
         return None
     if q["type"] == "number":
+        text = raw.replace("$", "").replace(" ", "").replace("\u00a0", "")
+        if re.match(r"^-?\d+,\d{1,2}$", text):
+            text = text.replace(",", ".")        # a decimal comma: 1,5 is one and a half, not fifteen
         try:
-            return float(raw.replace("$", "").replace(",", ""))
+            value = float(text.replace(",", ""))
         except ValueError:
             return None
+        return value if math.isfinite(value) else None
     if q["type"] == "multi":
         return [a.strip() for a in raw.split(";") if a.strip()]
     return raw
@@ -387,6 +429,13 @@ def import_responses(store, survey_id, csv_path, fielded_from=None, fielded_to=N
     batch = "%s:%s" % (os.path.basename(csv_path), sha256_file(csv_path)[:12])
     if store.one("SELECT 1 AS x FROM survey_responses WHERE survey_id = ? AND import_batch = ?", (survey_id, batch)):
         raise StoreError("this exact file was already imported into %s" % survey_id)
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+        header = set(csv.DictReader(fh).fieldnames or [])
+    if not header & {"respondent_key", "submitted_at"} and store.one(
+            "SELECT 1 AS x FROM survey_responses WHERE survey_id = ?", (survey_id,)):
+        raise StoreError("%s already has answers, and this file has neither a respondent_key nor a submitted_at column,"
+                         " so a re-export cannot be told apart from new respondents. Add one of those columns and"
+                         " import again." % survey_id)
     seen_keys = {r["respondent_key"] for r in store.rows(
         "SELECT respondent_key FROM survey_responses WHERE survey_id = ? AND respondent_key IS NOT NULL", (survey_id,))}
     seen_rows = {r["row_sha256"] for r in store.rows("SELECT row_sha256 FROM survey_responses WHERE survey_id = ?", (survey_id,))}
@@ -477,6 +526,7 @@ def matches(answer, match):
     """Does one answer satisfy a match spec? {'in': [...]}, {'gte': x}, {'lte': x}, {'eq': x}; keys combine with AND."""
     if answer in (None, []):
         return False
+    check_match(match, "match")
     ok = True
     if "in" in match:
         got = set(answer) if isinstance(answer, list) else {answer}
@@ -494,7 +544,7 @@ def count_matching(store, survey_id, question, match, among=None):
     """(k, n): valid respondents matching, out of valid respondents who answered (optionally within a subgroup)."""
     k = n = 0
     for a in valid_responses(store, survey_id):
-        if among and not matches(a.get(among["question"]), {x: among[x] for x in among if x != "question"}):
+        if among and not matches(a.get(among.get("question")), {x: among[x] for x in among if x != "question"}):
             continue
         if a.get(question) in (None, []):
             continue
@@ -535,6 +585,10 @@ def analyse_survey(store, survey_id):
                               " mirror the whole market." % (len(rows), sv["distributed_via"] or "an unrecorded channel")}
 
 
+def _finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def survey_prices(store, survey_id):
     """Price answers from a real survey: Van Westendorp rows and Gabor-Granger max prices, if the instrument has them."""
     sv = store.get("surveys", survey_id, "survey")
@@ -545,9 +599,9 @@ def survey_prices(store, survey_id):
     if vw:
         for a in rows:
             r = tuple(a.get(vw[k]) for k in ("too_cheap", "cheap", "expensive", "too_expensive"))
-            if all(isinstance(v, (int, float)) and v > 0 for v in r) and r[0] <= r[1] <= r[2] <= r[3]:
+            if all(_finite(v) and v > 0 for v in r) and r[0] <= r[1] <= r[2] <= r[3]:
                 out["van_westendorp"].append(r)
     gg = inst.get("gabor_granger")
     if gg:
-        out["gabor_granger"] = [a[gg["question"]] for a in rows if isinstance(a.get(gg["question"]), (int, float))]
+        out["gabor_granger"] = [a[gg["question"]] for a in rows if _finite(a.get(gg["question"]))]
     return out

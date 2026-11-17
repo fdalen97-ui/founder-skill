@@ -90,6 +90,13 @@ def read_json(path):
         raise StoreError("the input is not valid JSON: %s" % e)
 
 
+def _int(text, what):
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        raise StoreError("%s must be a number (got %r)" % (what, text))
+
+
 def as_list(obj):
     return obj if isinstance(obj, list) else [obj]
 
@@ -268,6 +275,8 @@ def dispatch(store, a, out):
             out("redacted %s: their words and stored records are removed and no longer counted" % a.id)
     elif a.cmd == "recruit":
         targets = read_json(a.json_path)
+        if not isinstance(targets, dict) or not all(isinstance(v, int) and v > 0 for v in targets.values()):
+            raise StoreError("targets must be an object of segment id to a number, for example {\"SEG001\": 10}")
         for sid in targets:
             store.get("segments", sid, "segment")
         store.set_meta("recruit_targets", json.dumps(targets, sort_keys=True))
@@ -289,7 +298,7 @@ def dispatch(store, a, out):
         return experiment_cmd(store, a, out)
     elif a.cmd == "void":
         if a.what == "event":
-            experiments.void_event(store, int(a.id), a.reason)
+            experiments.void_event(store, _int(a.id, "event id"), a.reason)
         else:
             experiments.void_transaction(store, a.id, a.reason)
         out("voided %s %s" % (a.what, a.id))
@@ -312,8 +321,9 @@ def dispatch(store, a, out):
                 out(r["do_not_build"])
     elif a.cmd == "hypotheses":
         for h in score.hypotheses(store):
-            out("%s %-12s priority %5.1f  %-24s %s%s" % (h["id"], h["area"], h["priority"], h["status"], h["statement"],
-                                                       "  (synthetic exploration only)" if h["explored_synthetically"] and not h["real_items"] else ""))
+            out("%s %-12s priority %5.1f  %-24s %s%s%s" % (h["id"], h["area"], h["priority"], h["status"], h["statement"],
+                                                         "  (synthetic exploration only)" if h["explored_synthetically"] and not h["real_items"] else "",
+                                                         "  (evidence predates the current wording)" if h["evidence_predates_wording"] else ""))
     elif a.cmd == "pricing":
         p = score.pricing(store, _sibling("founder-pricing", "van_westendorp"))
         if not p["layers"]:
@@ -379,7 +389,7 @@ def survey_cmd(store, a, out):
         for w in r["warnings"]:
             out("warning: %s" % w)
     elif a.action == "exclude":
-        research.exclude_response(store, int(a.id), a.reason)
+        research.exclude_response(store, _int(a.id, "response id"), a.reason)
         out("excluded response %s" % a.id)
     else:
         s = research.analyse_survey(store, a.id)
@@ -484,6 +494,11 @@ def main(argv=None, out=None):
         return run(a, out)
     except (StoreError, stats.StatsError) as e:
         print("error: %s" % e, file=sys.stderr)
+        return 2
+    except (TypeError, KeyError, ValueError, AttributeError, IndexError) as e:
+        # Input of the wrong shape. Nothing was saved: the transaction is rolled back when the store closes.
+        print("error: the input does not have the expected shape (%s: %s). Nothing was saved. See references/evidence.md."
+              % (type(e).__name__, e), file=sys.stderr)
         return 2
 
 

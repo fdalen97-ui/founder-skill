@@ -15,7 +15,8 @@ Write these with the founder before any outreach:
   procurement decision-maker separately. They are usually different people, and
   the person who likes the product is often not the one who pays. Interview each.
 - **Target**: 5 people per segment for a first read, 10 before relying on it.
-  Set it with `validate.py recruit --json '{"SEG001": 10}'`.
+  Write the targets to a file, for example `{"SEG001": 10}`, and set them with
+  `validate.py recruit --json targets.json`.
 
 ## The screener
 
@@ -172,6 +173,9 @@ Rules for extracts:
 
 - `verbatim: true` only for exact words. The tool checks them against the
   transcript and refuses anything else. Do not tidy a quote to make it stronger.
+  Lines labelled as the interviewer (`Interviewer:`, `Intervjuer:`, `Q:`,
+  `Moderator:`) are left out of the check, so label your own lines in the
+  transcript: an unlabelled question of yours could otherwise pass as a quote.
 - Everything else is a summary. Set `author` to `ai` when you wrote it and
   `founder` when they did. Reports label it as a summary, never as a quote.
 - Tag a `theme` in the customer's vocabulary, the same word for the same thing

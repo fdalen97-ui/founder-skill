@@ -87,7 +87,8 @@ def resolve(store, e):
         rows = store.rows(
             "SELECT x.kind, i.participant_id FROM interview_extracts x JOIN interviews i ON i.id = x.interview_id"
             " JOIN participants p ON p.id = i.participant_id WHERE x.id IN (%s) AND x.redacted_at IS NULL"
-            " AND p.redacted_at IS NULL" % ", ".join("?" * len(ref["extracts"])), list(ref["extracts"]))
+            " AND p.redacted_at IS NULL AND p.consent = 'recorded'" % ", ".join("?" * len(ref["extracts"])),
+            list(ref["extracts"]))
         out["keys"] = {r["participant_id"] for r in rows}
         out["strong_keys"] = {r["participant_id"] for r in rows if r["kind"] in PAST_BEHAVIOUR_KINDS}
         out["detail"] = "%d interviewed people, %d of them describing past behaviour or spend" % (
@@ -98,20 +99,32 @@ def resolve(store, e):
         k, n = research.count_matching(store, ref["survey"], ref["question"], ref["match"], ref.get("among"))
         out["pool"] = ("E", ref["survey"])
         out["units"] = k
-        out["strong_units"] = k if q["kind"] in ("behavioral", "screening") else 0
+        out["strong_units"] = k if q["kind"] == "behavioral" else 0   # everyone valid passed the screener: it proves nothing
         out["k"], out["n"] = k, n
         out["detail"] = "%d of %d valid answers to a %s question" % (k, n, {
             "behavioral": "past-behaviour", "screening": "screening", "stated": "stated-preference",
             "pricing": "stated-price"}.get(q["kind"], q["kind"]))
     elif cat == "F":
         c = experiments.counts(store, ref["experiment"], ref["event"], ref.get("denominator") or ref["event"], ref.get("variant"))
-        out["pool"] = ("F", ref["experiment"], ref["event"])
-        out["units"] = out["strong_units"] = c["k"]
+        outcome = experiments.read(store, ref["experiment"], record_look=False)["outcome"]
+        # One pool per experiment: a visit, a click and a demo request by the same ten people are ten people, not thirty.
+        out["pool"] = ("F", ref["experiment"])
         out["k"], out["n"] = c["k"], (c["n"] if ref.get("denominator") else None)
         left = c["unqualified_k"] + c["unknown_k"]
         out["detail"] = "%d qualified '%s'%s%s" % (
             c["k"], ref["event"], (" of %d qualified '%s'" % (c["n"], ref["denominator"])) if ref.get("denominator") else "",
             (" (%d more not counted: unqualified or unknown)" % left) if left else "")
+        if e["stance"] == "supports":
+            if outcome == "failure":
+                out["detail"] += ". The experiment failed its pre-set line, so this cannot count as support"
+            else:
+                out["units"] = out["strong_units"] = c["k"]
+        elif outcome == "failure" and ref.get("denominator") and c["k"] <= c["n"]:
+            out["units"] = out["strong_units"] = c["n"] - c["k"]
+            out["detail"] += ". Counted against: %d qualified people who saw it and did not act, in a test that failed" \
+                             " its pre-set line" % (c["n"] - c["k"])
+        else:
+            out["detail"] += ". Counts against a claim only when the experiment fails its pre-set line"
     elif cat == "G":
         m = experiments.money(store, experiment_id=ref.get("experiment"), ids=ref.get("transactions"))
         out["keys"] = out["strong_keys"] = {"PAY:" + p for p in m["payers"]}
@@ -177,7 +190,11 @@ def _evidence(store, where="", args=()):
     rows = store.rows("SELECT e.*, c.dimension, c.hypothesis_id, c.description AS claim FROM evidence e"
                       " JOIN claims c ON c.id = e.claim_id WHERE 1 = 1 " + where + " ORDER BY e.id", args)
     for e in rows:
-        e["resolved"] = resolve(store, e)
+        try:
+            e["resolved"] = resolve(store, e)
+        except Exception as err:   # a row that can no longer be resolved must not take the whole record down
+            e["resolved"] = {"category": e["category"], "units": 0, "strong_units": 0, "keys": set(), "strong_keys": set(),
+                             "pool": None, "detail": "could not be resolved (%s): counts for nothing" % type(err).__name__}
     return rows
 
 
@@ -256,8 +273,14 @@ def dimensions(store, numbers=None):
     return out
 
 
-AREA_DIMENSIONS = {"market": "problem", "problem": "problem", "product": "solution", "commercial": "payment",
-                   "distribution": "demand"}
+def _merge(tables):
+    out = {}
+    for t in tables:
+        for cat, c in t.items():
+            o = out.setdefault(cat, {"units": 0, "strong_units": 0, "tier": 0, "cap": 0})
+            for k in ("units", "strong_units", "tier", "cap"):
+                o[k] = max(o[k], c[k])
+    return out
 
 
 def hypotheses(store):
@@ -266,12 +289,22 @@ def hypotheses(store):
     out = []
     for h in store.rows("SELECT * FROM hypotheses WHERE retired_at IS NULL ORDER BY id"):
         mine = [e for e in items if e["hypothesis_id"] == h["id"]]
-        a = _assess(mine, GENERIC_CAPS)
+        # Each item is graded under the caps of the question its claim bears on, then the best is taken. Ten
+        # interviews attached to a payment claim do not answer a commercial hypothesis.
+        per = [_assess([e for e in mine if e["dimension"] == dim], CAPS[dim]) for dim in sorted({e["dimension"] for e in mine})]
+        a = _assess(mine, {})
+        if per:
+            s_tier, c_tier = max(p["support_tier"] for p in per), max(p["contra_tier"] for p in per)
+            label, contested = grade(s_tier, c_tier)
+            a.update({"level": label, "contested": contested, "tier": tier_of(label), "support_tier": s_tier, "contra_tier": c_tier,
+                      "support": _merge([p["support"] for p in per]), "contra": _merge([p["contra"] for p in per])})
         answered = a["level"] in (LEVELS[2], LEVELS[3], CONTRADICTED)
         effort = (h["test_cost"] + h["test_time"]) / 2.0
         h.update({"status": a["level"], "contested": a["contested"], "support": a["support"], "contra": a["contra"],
                   "explored_synthetically": a["synthetic_items"] > 0, "real_items": a["real_items"],
                   "answered": answered, "priority": round(h["impact"] * h["uncertainty"] / effort, 2),
+                  "evidence_predates_wording": h["version"] > 1 and any(
+                      e["created_at"] < h["updated_at"] and not e["retracted_at"] for e in mine),
                   "evidence_ids": [e["id"] for e in mine if not e["retracted_at"]]})
         out.append(h)
     out.sort(key=lambda h: (h["answered"], -h["priority"], h["id"]))
@@ -427,7 +460,9 @@ def verdict(dims):
         return {"decision": "Go", "because": list(DIMENSIONS), "conditions": [],
                 "text": "All seven questions have at least moderate real evidence and none is contradicted. The evidence"
                         " justifies the next stage of investment. It does not guarantee the business."}
-    if tier("problem") >= 2 and (tier("demand") >= 1 or tier("behavior") >= 1 or tier("payment") >= 1):
+    signal = any(c["units"] for k in ("demand", "behavior", "payment") for cat, c in level[k]["support"].items()
+                 if cat in REAL and level[k]["level"] != CONTRADICTED)
+    if tier("problem") >= 2 and signal:
         return {"decision": "Conditional Go", "because": [k for k in DIMENSIONS if k not in gaps and k not in against],
                 "conditions": gaps + against,
                 "text": "The problem is supported and there is some real demand signal. Continue only to close these gaps: %s."
@@ -442,9 +477,13 @@ MIN_COMPARABLE = 5
 
 
 def add_prediction(store, p):
+    if not isinstance(p, dict):
+        raise StoreError("a prediction must be a JSON object")
     for k in ("source", "prediction_type", "measured_what", "predicted"):
         if p.get(k) in (None, ""):
             raise StoreError("a prediction needs '%s'" % k)
+    if isinstance(p["predicted"], bool) or not isinstance(p["predicted"], (int, float)) or not 0 <= p["predicted"] <= 1:
+        raise StoreError("'predicted' must be a rate between 0 and 1 (0.1 for 10%)")
     model = p.get("model", "")
     if p["source"] == "synthetic":
         run = store.get("syn_runs", p.get("run_id"), "synthetic run")
@@ -474,6 +513,8 @@ def predict_from_run(store, rid, arm, segment_id=None):
 
 
 def add_outcome(store, o):
+    if not isinstance(o, dict):
+        raise StoreError("an outcome must be a JSON object")
     for k in ("prediction_id", "experiment_id", "event", "denominator", "measured_what", "comparable_note"):
         if o.get(k) in (None, ""):
             raise StoreError("an outcome needs '%s'" % k)
@@ -483,8 +524,9 @@ def add_outcome(store, o):
     x = store.get("experiments", o["experiment_id"], "experiment")
     if x["launched_at"] is None:
         raise StoreError("%s has not launched" % x["id"])
-    if x["completed_at"] and x["completed_at"] < p["made_at"]:
-        raise StoreError("%s was recorded after %s had finished. A number written down after the result is known is not a"
+    first = store.one("SELECT MIN(created_at) AS t FROM behavior_events WHERE experiment_id = ?", (x["id"],))["t"]
+    if (x["completed_at"] and x["completed_at"] < p["made_at"]) or (first and first < p["made_at"]):
+        raise StoreError("%s was recorded after %s had data. A number written down once results are coming in is not a"
                          " prediction." % (p["id"], x["id"]))
     return store.insert("outcomes", {"prediction_id": p["id"], "experiment_id": x["id"], "measured_what": o["measured_what"],
                                      "event": o["event"], "denominator": o["denominator"],
@@ -503,8 +545,11 @@ def calibration(store):
         actual = stats.rate(c["k"], c["n"]) if c["k"] <= c["n"] else None
         lo, hi = stats.wilson(c["k"], c["n"]) if actual is not None else (None, None)
         design = json.loads(x["design_json"])
-        reasons = ["They measure different things: the prediction is '%s'; the result is '%s'. A stated or simulated"
-                   " stance is not an action." % (p["measured_what"], o["measured_what"])]
+        reasons = []
+        if not o["comparable"] or p["measured_what"].strip().lower() != o["measured_what"].strip().lower() \
+                or p["source"] == "synthetic":
+            reasons.append("They measure different things: the prediction is '%s'; the result is '%s'. A stated or"
+                           " simulated stance is not an action." % (p["measured_what"], o["measured_what"]))
         if p["segment_id"] != x["segment_id"]:
             reasons.append("Different audience: predicted for %s, measured on %s." % (
                 segs.get(p["segment_id"], "an unspecified segment"), segs.get(x["segment_id"], "an unspecified segment")))
@@ -518,7 +563,8 @@ def calibration(store):
             reasons.append("Simulated profiles lean agreeable, and their mix was set by quota, not by the market.")
         reasons += ["The problem may matter less than assumed.", "The offer or message on the page may be weak or unclear.",
                     "The price may be too high for the value shown."]
-        pairs.append({"prediction_id": p["id"], "experiment_id": x["id"], "source": p["source"], "model": p["model"],
+        pairs.append({"prediction_id": p["id"], "experiment_id": x["id"], "run_id": p["run_id"], "source": p["source"],
+                      "model": p["model"],
                       "prediction_type": p["prediction_type"], "segment": segs.get(p["segment_id"]),
                       "scenario": p["scenario"], "methodology": p["methodology"], "predicted": p["predicted"],
                       "predicted_measure": p["measured_what"], "actual": actual, "actual_k": c["k"], "actual_n": c["n"],
@@ -526,10 +572,19 @@ def calibration(store):
                       "difference": (p["predicted"] - actual) if actual is not None else None,
                       "comparable": bool(o["comparable"]), "comparable_note": o["comparable_note"],
                       "made_at": p["made_at"], "possible_reasons": reasons})
-    groups = {}
+    groups, seen = {}, set()
     for pr in pairs:
         if pr["comparable"] and pr["actual"] is not None:
-            groups.setdefault((pr["source"], pr["model"], pr["prediction_type"]), []).append(pr)
+            key = (pr["source"], pr["model"], pr["prediction_type"])
+            # One pair per experiment and one per synthetic run: the same prediction filed five times, or five
+            # predictions checked against one result, is still one observation.
+            marks = {(key, "x", pr["experiment_id"])} | ({(key, "r", pr["run_id"])} if pr["run_id"] else set())
+            if marks & seen:
+                pr["counted"] = False
+                continue
+            seen |= marks
+            pr["counted"] = True
+            groups.setdefault(key, []).append(pr)
     summary = []
     for (source, model, ptype), items in sorted(groups.items()):
         row = {"source": source, "model": model, "prediction_type": ptype, "comparable_pairs": len(items),
@@ -594,7 +649,7 @@ def pricing(store, van_westendorp=None):
                               "items": comp, "reading": "What the alternatives charge, with links. Check what each price includes."})
     for x in store.rows("SELECT id, title, type FROM experiments WHERE launched_at IS NOT NULL ORDER BY id"):
         r = experiments.read(store, x["id"], record_look=False)
-        priced = [a for a in r["arms"] if a["price_point"] is not None and a["n"]]
+        priced = [a for a in r["arms"] if a["price_point"] is not None and a["n"] and a["k"] <= a["n"]]
         if priced:
             out["layers"].append({"layer": 5, "name": "Real offers", "category": "F", "ref": x["id"], "title": x["title"],
                                   "arms": [{"price": a["price_point"], "k": a["k"], "n": a["n"], "rate": a["rate"],
