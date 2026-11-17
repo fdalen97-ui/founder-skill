@@ -74,7 +74,10 @@ Write `founder/pricing.md`:
 
 ## Rules
 
-- Price answers from simulated buyers pick what to test. They are not proof.
+- Price answers from simulated buyers pick what to test. They are not proof. Nor
+  are survey answers: what people say they would pay is a stated preference. Run
+  the real test through `/founder-validate` (a price test or a pre-order), which
+  keeps simulated answers, survey answers, real offers and actual payments apart.
 - Never price below variable cost to "buy" customers without saying so, and how
   long the CFO says the business can afford it.
 - No fake anchors: no "was $X" price that was never charged.

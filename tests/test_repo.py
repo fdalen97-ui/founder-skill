@@ -6,9 +6,11 @@ import unittest
 from _load import ROOT, SKILLS_DIR
 
 SKILLS = ["founder-board", "founder-marketing", "founder-cfo", "founder-consumer", "founder-launch",
-          "founder-pricing", "founder-offer", "founder-competitors", "founder-brand", "founder-ops", "founder-plan"]
-ABOUT = ("Eleven free Claude skills that test a business before you launch it: a board trained on Hormozi, "
-         "Thiel and Jobs, a marketing director, a CFO, and a consumer panel of 100 buyer agents. Free, MIT.")
+          "founder-pricing", "founder-offer", "founder-competitors", "founder-brand", "founder-ops", "founder-plan",
+          "founder-validate"]
+ABOUT = ("Twelve free Claude skills that test a business before you launch it: a board trained on Hormozi, "
+         "Thiel and Jobs, a marketing director, a CFO, a consumer panel of 100 buyer agents, and a validation "
+         "engine that tracks what real customers said, did and paid for. Free, MIT.")
 
 
 def frontmatter(path):
@@ -30,7 +32,7 @@ def text_files():
 
 
 class Repo(unittest.TestCase):
-    def test_eleven_skill_folders(self):
+    def test_twelve_skill_folders(self):
         found = sorted(d for d in os.listdir(SKILLS_DIR) if os.path.isfile(os.path.join(SKILLS_DIR, d, "SKILL.md")))
         self.assertEqual(found, sorted(SKILLS))
 
@@ -65,7 +67,7 @@ class Repo(unittest.TestCase):
             readme = " ".join(fh.read().split())
         self.assertTrue(readme.startswith("# The Founder skill"))
         for line in (
-            "Eleven Claude skills that test a business before you launch it. Free, MIT, no signup, no API key, "
+            "Twelve Claude skills that test a business before you launch it. Free, MIT, no signup, no API key, "
             "nothing to connect.",
             "One of them is your board of directors, trained on the frameworks of Alex Hormozi, Peter Thiel and "
             "Steve Jobs. One is your marketing director. One is your CFO and finds your real profit margins. And "
