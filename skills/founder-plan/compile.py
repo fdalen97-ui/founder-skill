@@ -14,6 +14,13 @@ The checks:
     2. year 1 makes an operating profit                 (founder/numbers.json)
     3. break-even fits inside capacity, if capacity is given
     4. enough of the buyer panel buys                   (founder/panel/results.json, --min-buy-rate, default 25%)
+       This is a simulated screen. It can flag a weak idea; it is not evidence of demand.
+    5. real customer evidence does not contradict the idea (founder/validation/, written by founder-validate)
+
+Under the verdict the plan prints the real-customer validation status from
+founder-validate: Go, Conditional Go, No-Go, or not validated yet. "Profitable"
+is a statement about the projected numbers. Whether real customers want it and
+pay for it is that second line, and only real evidence can move it.
 
     python3 compile.py                      # reads ./founder, writes ./founder/business-plan.md
     python3 compile.py --dir path/to/founder --min-buy-rate 0.3
@@ -33,6 +40,7 @@ SECTIONS = [  # (file in founder/, heading, which skill writes it)
     ("board.md", "What the board said", "founder-board"),
     ("competitors.md", "The competition", "founder-competitors"),
     ("panel/results.md", "The buyer panel", "founder-consumer"),
+    ("validation/validation-report.md", "Market validation", "founder-validate"),
     ("pricing.md", "Pricing", "founder-pricing"),
     ("offer.md", "The offer", "founder-offer"),
     ("cfo.md", "The numbers", "founder-cfo"),
@@ -49,6 +57,33 @@ def _load_unit_economics():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def validation(d):
+    """The real-customer evidence status from founder-validate, or None if it has not been started."""
+    folder = os.path.join(d, "validation")
+    if not os.path.exists(os.path.join(folder, "validation.db")):
+        return None
+    path = os.path.join(HERE, "..", "founder-validate", "validate.py")
+    spec = importlib.util.spec_from_file_location("founder_validate", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    store = mod.Store(folder)
+    try:
+        snap = mod.snapshot(store)
+    finally:
+        store.close()
+    return {"decision": snap["verdict"]["decision"], "text": snap["verdict"]["text"], "counts": snap["counts"],
+            "contradicted": [x["dimension"] for x in snap["dimensions"] if x["level"] == "Contradicted by evidence"]}
+
+
+def validation_line(val):
+    if val is None:
+        return ("Real-customer validation: not started. Nothing in this plan has been confirmed with real customers yet."
+                " Run /founder-validate.")
+    c = val["counts"]
+    return "Real-customer validation: %s. Based on %d people interviewed, %d valid survey answers, %d qualified actions and %d paying customers." % (
+        val["decision"], c["real_people_interviewed"], c["valid_survey_responses"], c["qualified_actions"], c["paying_customers"])
 
 
 def _read(path):
@@ -91,8 +126,12 @@ def verdict(d, min_buy_rate=0.25):
     if raw:
         panel = json.loads(raw)
         r = panel["buy_rate"]
-        checks.append((r >= min_buy_rate, "%d of %d simulated buyers buy (%.0f%%, the bar is %.0f%%)." % (
-            panel["buys"], panel["answered"], r * 100, min_buy_rate * 100)))
+        checks.append((r >= min_buy_rate, "%d of %d simulated buyers buy (%.0f%%, the bar is %.0f%%). A simulated screen,"
+                       " not evidence of demand." % (panel["buys"], panel["answered"], r * 100, min_buy_rate * 100)))
+    val = validation(d)
+    if val and val["decision"] == "No-Go":
+        checks.append((False, "Real customer evidence contradicts the idea (%s). See the market validation report."
+                       % ", ".join(val["contradicted"])))
     if numbers is None:
         v = "Incomplete"
     elif all(ok for ok, _ in checks):
@@ -112,6 +151,8 @@ def compile_plan(d, min_buy_rate=0.25):
     title = name or (numbers["business"] if numbers and numbers.get("business") else "Your business")
     L = ["# %s · Business plan" % title, ""]
     L.append("**Verdict: %s**" % v)
+    L.append("")
+    L.append("**%s**" % validation_line(validation(d)))
     L.append("")
     for ok, text in checks:
         L.append("- %s %s" % ("✓" if ok else "✗", text))
@@ -164,6 +205,7 @@ def main(argv=None):
     if a.check:
         _, checks, _, _ = verdict(a.dir, a.min_buy_rate)
         print("Verdict: %s" % v)
+        print(validation_line(validation(a.dir)))
         for ok, t in checks:
             print("  %s %s" % ("✓" if ok else "✗", t))
         return 0 if v == "Profitable" else 1

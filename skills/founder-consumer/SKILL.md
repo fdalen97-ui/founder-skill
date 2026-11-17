@@ -105,9 +105,16 @@ file, so suggest accept-edits mode (Shift+Tab) for the run.
 
 These are simulated buyers. They are good at surfacing objections, segments and
 wording you had not thought of, and bad at predicting real conversion: language
-models lean agreeable, so treat the buy rate as an upper bound. Confirm the big
-calls with real people (a waitlist, a pre-sale, a landing page with a price)
-before signing anything. Do not present panel quotes as customer testimonials.
+models lean agreeable, and a hundred answers from one model are not a hundred
+independent people. The buy rate is not a forecast. Confirm the big calls with
+real people (a waitlist, a pre-sale, a landing page with a price) before signing
+anything. Do not present panel quotes as customer testimonials.
+
+`/founder-validate` is where that confirmation is tracked. It can put this panel
+on the evidence record as simulated (`validate.py synth import-panel`), where it
+counts for nothing until real customers back it up, and its own synthetic lab
+goes further when you want it: forced skeptics, a problem stage with no product
+shown, and repeat runs.
 
 ## The brief every buyer gets
 
@@ -123,4 +130,5 @@ expensive, too expensive). Never edit a brief for one buyer.
 
 `founder/customer.json`, `founder/pitch.md`, `founder/panel/` (cards, briefs,
 answers, results). Next: `/founder-pricing` reads the price answers,
-`/founder-offer` and `/founder-marketing` read the objections.
+`/founder-offer` and `/founder-marketing` read the objections, and
+`/founder-validate` turns the objections into questions for real customers.

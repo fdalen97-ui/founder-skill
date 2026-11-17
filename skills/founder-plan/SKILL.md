@@ -35,7 +35,16 @@ prints the verdict and each check. The checks, all computed:
 2. Year 1 makes an operating profit.
 3. The break-even fits inside capacity, if a capacity was given.
 4. Enough simulated buyers buy (`founder/panel/results.json`; default bar 25%,
-   change it with `--min-buy-rate` and say why).
+   change it with `--min-buy-rate` and say why). This is a simulated screen, not
+   evidence of demand.
+5. Real customer evidence does not contradict the idea (`founder/validation/`,
+   kept by `/founder-validate`). A No-Go there fails the plan.
+
+Under the verdict the tool prints where real-customer validation stands: not
+started, No recommendation yet, Conditional Go, Go or No-Go, with the number of
+real people, actions and payments behind it. Always read that line out with the
+verdict. "Profitable" describes the projection. Only that second line says
+whether customers have confirmed it.
 
 If there are no numbers, the verdict is Incomplete: offer to run `/founder-cfo`.
 List the other missing sections with the skill that fills each. Do not fill a
@@ -70,7 +79,8 @@ not done yet.
 
 Write `founder/one-pager.md` for someone deciding in two minutes: the problem, the
 customer, the offer and price, the numbers table, the evidence (panel result,
-competitor gap, any real test), what the money is for, and the ask. Same numbers as
+competitor gap, and the validation status with its counts of real interviews,
+actions and payments), what the money is for, and the ask. Same numbers as
 the plan, word for word.
 
 ## Rules

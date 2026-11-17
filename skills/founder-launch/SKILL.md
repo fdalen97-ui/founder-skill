@@ -29,9 +29,12 @@ big costs in `founder/numbers.json`:
 | subscription | a founding-member offer, paid up front |
 
 Write the success line before running it (for example: 50 pre-orders in two weeks
-at $6.50), and compare the result with the panel's buy rate. If real buyers fall
-well short of the panel, trust the real buyers and go back to `/founder-offer` or
-`/founder-pricing`.
+at $6.50). If `/founder-validate` is in use, register the test there before it
+starts (`validate.py experiment register`): the success line is locked at launch,
+only qualified buyers are counted, and the result goes on the evidence record
+whether it passes or fails. Set the result beside the panel's answer, do not
+average the two, and if real buyers fall short of the panel, trust the real buyers
+and go back to `/founder-offer` or `/founder-pricing`.
 
 ## Step 2: the countdown
 
